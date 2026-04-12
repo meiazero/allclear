@@ -5,117 +5,134 @@
 [![arXiv](https://img.shields.io/badge/arXiv-AllClear-red)](https://arxiv.org/abs/2410.23891)
 [![Project](https://img.shields.io/badge/project-AllClear-blue)](https://allclear.cs.cornell.edu)
 
-`AllClear` is a comprehensive dataset/benchmark for cloud detection and removal. 
+`AllClear` is a comprehensive dataset/benchmark for cloud detection and removal.
 
-**Notice:** We are actively cleaning up the codebase and uploading our dataset for public access. Stay tuned!
+This fork adds support for **geographically filtered subsets** via Brazilian biome boundaries (IBGE 2019), with `uv`-managed dependencies and independent download steps for reproducibility.
 
 ![Geographical distribution of AllClear](images/allclear.svg)
 
 ## Setup
-<!-- `AllClear` comes with minimal package requirements. It can be easily installed using pip. 
-Please navigate to the root directory of this project and run the following commands:
 
-```bash
-pip install -e .
-``` -->
-
-Please navigate to the root directory of this project and run the following commands:
 ```bash
 # Clone the repository
-git clone https://github.com/Zhou-Hangyu/allclear.git
-
-# Obtain the baselines
+git clone <this-repo>
 cd allclear
-git submodule update --init --recursive
 
-# Download the dataset and metadata json file.
-python download.py
+# Install dependencies (requires uv — https://docs.astral.sh/uv)
+uv sync
 ```
-
-## Benchmark Usage
-
-This section provides instructions on how to use the benchmark with the `UnCRtainTS` model as an example.
-
-1. First, set up the environment for `UnCRtainTS`. Visit the [UnCRtainTS GitHub page](https://github.com/PatrickTUM/UnCRtainTS) and follow the instructions there to create their conda environment.
-
-2. After setting up the `UnCRtainTS` environment, navigate to the root directory of this project and install our package using pip:
-
-    ```bash
-    pip install -e .
-    ```
-
-3. To run the benchmark and see some results, execute the `run_benchmark.sh` script located in the `demos` directory:
-
-    ```bash
-    # Run the Least Cloudy baseline
-    bash demos/run_leastcloud.sh 
-
-    # Run the pretrained UnCRtainTS
-    bash demos/run_uncrtaints_pretrained.sh 
-
-    # Run the UnCRtainTS pretrained on our full allclear dataset 
-    bash demos/run_uncrtaints_allclear100pc.sh 
-    ```
-
-## Notes
-* We use [Cloud Optimized GeoTIFF (COG)](http://cogeo.org/) format to store all our GeoTIFF files.
-* The raw data comes with gaps (NaN values) around the boundaries due to map projection. 
-We currently center-crop the images on the fly to get rid of the gaps.
-We are working on post-processing the entire dataset to crop them for good.
 
 ## Dataset Download
-You can download the dataset by running `python download.py` in the root directory of this project. This script will download the entire AllClear dataset, along with the metadata files. 
 
-### Metadata
-The metadata files are grouped into three folders: `data`, `datasets`, and `rois`.
-* `data` contains metadata for the raw satellite images, grouped by satellite sensor.
-* `datasets` contains metadata for the datasets we created. The naming convention is `{dataset_split}_{input_sequence_length}_{sensor_list}_{percentage_of_data_used}(_{1proi}).json`.
-  * `dataset_split` can be `train`, `val`, or `test`.
-  * `input_sequence_length` is the number of frames in the input sequence. `tx3` means 3-frame input, `tx12` means 12-frame input.
-  * `sensor_list` is a list of satellite sensors used in the dataset. `s2-s1` means S2 and S1, `s2-s1-landsat` means S2, S1, and Landsat8/9.
-  * `percentage_of_data_used` is the percentage of data used to create the dataset, e.g. `100pct` means 100% of the data is used.
-  * `1proi` indicates that the dataset is created by randomly sampling 1 sample in each ROI. We use this to create a lightweight test set.
-* `rois` contains metadata for the regions of interest (ROIs) we created.
+The download pipeline is split into independent steps that can be run separately.
 
-Here is the list of metadata files:
+### Step 1 — Metadata
+
+Downloads and extracts the metadata files (~few MB). Required before any other step.
+
+```bash
+uv run python download.py --metadata-only
 ```
-.
-├── data
-│ ├── dw_metadata.csv
-│ ├── landsat8_metadata.csv
-│ ├── landsat9_metadata.csv
-│ ├── s1_metadata.csv
-│ └── s2_metadata.csv
-├── datasets
-│ ├── test_tx3_s2-s1_100pct_1proi.json
-│ ├── test_tx3_s2-s1_100pct.json
-│ ├── test_tx3_s2-s1-landsat_100pct_1proi.json
-│ ├── test_tx3_s2-s1-landsat_100pct.json
-│ ├── train_tx12_s2-s1_100pct.json
-│ ├── train_tx12_s2-s1_3.4pct.json
-│ ├── train_tx3_s2-s1_100pct.json
-│ ├── train_tx3_s2-s1_10pct.json
-│ ├── train_tx3_s2-s1_1pct.json
-│ ├── train_tx3_s2-s1_3.4pct.json
-│ ├── train_tx3_s2-s1-landsat_100pct.json
-│ ├── train_tx3_s2-s1-landsat_3.4pct.json
-│ ├── val_tx12_s2-s1_100pct.json
-│ └── val_tx3_s2-s1-landsat_100pct.json
-├── rois
-│ ├── rois_metadata.csv
-│ ├── test_rois_3k.txt
-│ ├── train_rois_19k.txt
-│ └── val_rois_1k.txt
+
+### Step 2 — Biome shapefile (optional, for biome filtering)
+
+Downloads the official IBGE 2019 *Biomas do Brasil* shapefile (1:250,000), verifies its
+SHA256, reprojects to WGS84, and saves to `metadata/shapefiles/biomas_wgs84.gpkg`.
+Prints the SHA256 on first run — record it for reproducibility.
+
+```bash
+uv run python download_shapefile.py
 ```
+
+Available biomes: `amazonia`, `cerrado`, `pantanal`, `mata_atlantica`, `caatinga`, `pampa`.
+
+### Step 3 — Filter dataset JSONs
+
+Generates filtered versions of the dataset JSONs restricted to the selected biomes and
+sensors. Original files are **never overwritten**; outputs are saved with a short suffix
+(e.g. `train_tx3_s2-s1_100pct_amz-cer-pan.json`).
+
+```bash
+# Sentinel-2 only (default)
+uv run python filter_datasets.py --biomes amazonia cerrado pantanal
+
+# Include additional sensors
+uv run python filter_datasets.py --biomes amazonia cerrado pantanal \
+    --sensors s2_toa s1
+```
+
+### Step 4 — Download ROI images
+
+Downloads the ROI `.tar.gz` archives and extracts them to `./data/`. Skips ROIs that are
+already present. Can be combined with any spatial filter.
+
+```bash
+# All ROIs (full dataset, ~4 TB)
+uv run python download.py --data-only
+
+# Brazil biomes subset (requires steps 1–2)
+uv run python download.py --data-only --biomes amazonia cerrado pantanal --cpus 8
+
+# Approximate Brazil bounding box (no shapefile needed)
+uv run python download.py --data-only --brazil
+
+# Custom bounding box
+uv run python download.py --data-only --bbox -33.75 -73.99 5.27 -28.85
+```
+
+### Run everything at once
+
+```bash
+uv run python download.py --biomes amazonia cerrado pantanal --cpus 8
+```
+
+> Steps 1 and 4 run sequentially. The shapefile (step 2) and JSON filtering (step 3)
+> must be run separately before using `--biomes`.
+
+## Metadata structure
+
+```
+metadata/
+├── data/
+│   ├── dw_metadata.csv
+│   ├── landsat8_metadata.csv
+│   ├── landsat9_metadata.csv
+│   ├── s1_metadata.csv
+│   └── s2_metadata.csv
+├── datasets/
+│   ├── test_tx3_s2-s1_100pct.json
+│   ├── train_tx3_s2-s1_100pct.json
+│   ├── train_tx3_s2-s1_100pct_amz-cer-pan.json   ← filtered (generated)
+│   └── ...
+├── rois/
+│   ├── rois_metadata.csv
+│   ├── rois_amz-cer-pan.txt                       ← filtered ROI list (generated)
+│   ├── test_rois_3k.txt
+│   ├── train_rois_19k.txt
+│   └── val_rois_1k.txt
+└── shapefiles/
+    ├── biomas_wgs84.gpkg                           ← generated by download_shapefile.py
+    └── .sha256
+```
+
+### Dataset JSON naming convention
+
+`{split}_{sequence_length}_{sensors}_{pct_data}[_{suffix}].json`
+
+| Field | Values |
+|---|---|
+| `split` | `train`, `val`, `test` |
+| `sequence_length` | `tx3` (3 frames), `tx12` (12 frames) |
+| `sensors` | `s2-s1`, `s2-s1-landsat` |
+| `pct_data` | `100pct`, `10pct`, `3.4pct`, `1pct` |
+| `suffix` | biome abbreviation, e.g. `amz-cer-pan` |
+
+## Notes
+
+* Images are stored as [Cloud Optimized GeoTIFF (COG)](http://cogeo.org/), 256×256 pixels at 10 m resolution.
+* Raw data may contain NaN values near tile boundaries due to map projection; the dataset loader center-crops on the fly.
+* Biome assignment uses a point-in-polygon test on each ROI's centroid — patches near biome boundaries may straddle two biomes.
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-
-
-## Internal Notes (for developers)
-* The main package folder is `allclear`. Should only contain reusable code directly related to the use of the dataset and benchmark.
-* Every baseline we proposed or reproduced should have one folder in the `/baselines` folder.
-  * They will have a wrapper in `allclear/baselines.py` with uniform input/output format for easy comparison.
-* The `demo` folder contains minimal code to demonstrate the use of the dataset and benchmark.
-* For all other code, please put them in the `/experimental_scripts` folder for now.
