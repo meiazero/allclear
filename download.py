@@ -1,9 +1,23 @@
+import csv
+import unicodedata
 import requests
 from pathlib import Path
 import multiprocessing as mp
 from tqdm import tqdm
 import time
 import argparse
+
+# Brazil bounding box
+BRAZIL_BBOX = (-33.75, -73.99, 5.27, -28.85)  # (lat_min, lon_min, lat_max, lon_max)
+
+GPKG_PATH = Path("metadata/shapefiles/biomas_wgs84.gpkg")
+ROIS_CSV = Path("metadata/rois/rois_metadata.csv")
+
+
+def normalize_name(name: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", str(name))
+    ascii_str = nfkd.encode("ASCII", "ignore").decode("ASCII")
+    return ascii_str.lower().replace(" ", "_").replace("-", "_")
 
 # Configuration
 BASE_URL = "http://allclear.cs.cornell.edu/dataset/allclear"
@@ -85,21 +99,94 @@ def download_metadata():
         print(f"Skipping {filename} - not found on server")
 
 
-def load_roi_list():
-    """Load and combine all ROI IDs from metadata files"""
+def load_roi_list(bbox=None, biomes=None):
+    """Load and combine all ROI IDs from metadata files, with optional filtering.
+
+    Priority: biomes (shapefile) > bbox > none (all ROIs).
+
+    Args:
+        bbox:   (lat_min, lon_min, lat_max, lon_max) or None
+        biomes: list of normalized biome names or None
+    """
     metadata_dir = Path("metadata")
     roi_ids = set()
-    
+
     for filename in ["test_rois_3k.txt", "train_rois_19k.txt", "val_rois_1k.txt"]:
         file_path = metadata_dir / "rois" / filename
         if not file_path.exists():
             print(f"Warning: {filename} not found")
             continue
-            
         with open(file_path, 'r') as f:
-            roi_ids.update(line.strip() for line in f)
-    
-    return sorted(list(roi_ids))
+            roi_ids.update(line.strip() for line in f if line.strip())
+
+    if biomes:
+        return _filter_by_biomes(roi_ids, biomes)
+
+    if bbox:
+        return _filter_by_bbox(roi_ids, bbox)
+
+    return sorted(roi_ids)
+
+
+def _filter_by_biomes(roi_ids: set, biomes: list) -> list:
+    """Filter ROIs using the IBGE biomes shapefile (point-in-polygon)."""
+    try:
+        import geopandas as gpd
+        import pandas as pd
+        from shapely.geometry import Point
+    except ImportError:
+        raise ImportError("geopandas required for --biomes. Run: uv add geopandas")
+
+    if not GPKG_PATH.exists():
+        raise FileNotFoundError(
+            f"{GPKG_PATH} not found. Run download_shapefile.py first."
+        )
+    if not ROIS_CSV.exists():
+        raise FileNotFoundError(f"{ROIS_CSV} not found.")
+
+    print(f"Loading biomes shapefile for: {biomes}")
+    biomes_gdf = gpd.read_file(GPKG_PATH)
+    selected = biomes_gdf[biomes_gdf["biome"].isin(biomes)]
+    if selected.empty:
+        available = sorted(biomes_gdf["biome"].unique())
+        raise ValueError(f"No biomes matched {biomes}.\nAvailable: {available}")
+
+    rois_df = pd.read_csv(ROIS_CSV)
+    rois_gdf = gpd.GeoDataFrame(
+        rois_df,
+        geometry=[Point(float(r.longitude), float(r.latitude)) for r in rois_df.itertuples()],
+        crs="EPSG:4326",
+    )
+
+    joined = gpd.sjoin(rois_gdf, selected[["biome", "geometry"]], how="inner", predicate="within")
+    biome_roi_ids = set("roi" + str(rid) for rid in joined["roi_id"].astype(str))
+
+    result = sorted(roi_ids & biome_roi_ids)
+    for biome in sorted(biomes):
+        count = joined[joined["biome"] == biome].shape[0]
+        print(f"  {biome}: {count:,} ROIs")
+    print(f"Biome filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
+    return result
+
+
+def _filter_by_bbox(roi_ids: set, bbox: tuple) -> list:
+    """Filter ROIs using a lat/lon bounding box."""
+    lat_min, lon_min, lat_max, lon_max = bbox
+    if not ROIS_CSV.exists():
+        print("Warning: rois_metadata.csv not found, skipping bbox filter")
+        return sorted(roi_ids)
+
+    with open(ROIS_CSV, newline='') as f:
+        filtered = {
+            f"roi{row['roi_id']}"
+            for row in csv.DictReader(f)
+            if lat_min <= float(row['latitude']) <= lat_max
+            and lon_min <= float(row['longitude']) <= lon_max
+        }
+
+    result = sorted(roi_ids & filtered)
+    print(f"Bbox filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
+    return result
 
 def download_roi_worker(roi_batch):
     """Worker function for parallel ROI downloads"""
@@ -143,33 +230,81 @@ def download_roi_worker(roi_batch):
             print(f"Skipping {filename} - not found on server")
 
 def main():
-    # Add argument parser
-    parser = argparse.ArgumentParser(description='Download dataset with configurable CPU cores')
+    parser = argparse.ArgumentParser(
+        description="Download AllClear dataset.\n\n"
+                    "Steps can be run independently:\n"
+                    "  metadata only : --metadata-only\n"
+                    "  images only   : --data-only  (metadata must already exist)\n"
+                    "  both (default): omit both flags",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Steps
+    step = parser.add_mutually_exclusive_group()
+    step.add_argument('--metadata-only', action='store_true',
+                      help='Download and extract metadata only, then stop')
+    step.add_argument('--data-only', action='store_true',
+                      help='Skip metadata download, go straight to ROI images '
+                           '(metadata must already exist in ./metadata/)')
+    # Resources
     parser.add_argument('--cpus', type=int, default=8,
-                       help='Number of CPU cores to use (default: 8)')
+                        help='Number of CPU cores to use (default: 8)')
+    # Spatial filters (mutually exclusive, biomes takes priority)
+    spatial = parser.add_mutually_exclusive_group()
+    spatial.add_argument('--biomes', nargs='+',
+                         help='Download only ROIs within selected biomes '
+                              '(requires download_shapefile.py first). '
+                              'e.g. --biomes amazonia cerrado pantanal')
+    spatial.add_argument('--brazil', action='store_true',
+                         help='Download only ROIs within Brazil (bbox approximation)')
+    spatial.add_argument('--bbox', type=float, nargs=4,
+                         metavar=('LAT_MIN', 'LON_MIN', 'LAT_MAX', 'LON_MAX'),
+                         help='Download only ROIs within bounding box')
     args = parser.parse_args()
-    
-    # Calculate N_CORES using args.cpus
-    n_cores = max(1, args.cpus - 1)  # Leave one core free
-    
-    # Download metadata files
-    print("Downloading metadata files...")
-    download_metadata()
-    
-    # Load ROI IDs
-    print("\nLoading ROI IDs from metadata...")
-    roi_ids = load_roi_list()
-    print(f"Found {len(roi_ids)} unique ROI IDs")
-    
-    # Split ROIs into chunks for parallel processing
+
+    n_cores = max(1, args.cpus - 1)
+
+    # --- Step 1: metadata ---
+    if not args.data_only:
+        print("==> Step 1/2: Downloading metadata...")
+        download_metadata()
+    else:
+        metadata_dir = Path("metadata")
+        if not (metadata_dir / "rois" / "rois_metadata.csv").exists():
+            parser.error("--data-only requires metadata to already exist. "
+                         "Run without --data-only first, or use --metadata-only.")
+        print("==> Step 1/2: Skipping metadata download (--data-only).")
+
+    if args.metadata_only:
+        print("\nMetadata download complete (--metadata-only).")
+        roi_ids = load_roi_list()
+        print(f"Available ROIs: {len(roi_ids):,} total")
+        return
+
+    # --- Step 2: ROI images ---
+    # Resolve spatial filter
+    biomes = None
+    bbox = None
+    if args.biomes:
+        biomes = [normalize_name(b) for b in args.biomes]
+        print(f"\nBiome filter: {biomes}")
+    elif args.brazil:
+        bbox = BRAZIL_BBOX
+        print(f"\nBrazil bbox filter: {BRAZIL_BBOX}")
+    elif args.bbox:
+        bbox = tuple(args.bbox)
+        print(f"\nBbox filter: {bbox}")
+
+    print("\n==> Step 2/2: Loading ROI list...")
+    roi_ids = load_roi_list(bbox=bbox, biomes=biomes)
+    print(f"Found {len(roi_ids):,} unique ROI IDs")
+
     chunk_size = len(roi_ids) // n_cores + 1
     roi_chunks = [roi_ids[i:i + chunk_size] for i in range(0, len(roi_ids), chunk_size)]
-    
-    # Download ROIs in parallel
-    print(f"\nDownloading ROIs using {n_cores} processes...")
+
+    print(f"Downloading ROIs using {n_cores} processes...")
     with mp.Pool(n_cores) as pool:
         pool.map(download_roi_worker, roi_chunks)
-    
+
     print("\nDownload completed!")
 
 if __name__ == "__main__":
