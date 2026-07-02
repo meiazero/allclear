@@ -22,6 +22,7 @@ def normalize_name(name: str) -> str:
 # Configuration
 BASE_URL = "http://allclear.cs.cornell.edu/dataset/allclear"
 CHUNK_SIZE = 8192
+AVG_MB_PER_ROI = 184  # ponytail: measured median of sampled ROI archives; --dry-run estimate only
 
 def download_file(url, dest_path, show_progress=True):
     """Download a file with progress bar and return success status"""
@@ -188,6 +189,19 @@ def _filter_by_bbox(roi_ids: set, bbox: tuple) -> list:
     print(f"Bbox filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
     return result
 
+def rois_from_json(json_paths):
+    """Set of ROI ids referenced by one or more dataset JSONs (sample['roi'][0])."""
+    import json
+    roi_ids = set()
+    for p in json_paths:
+        with open(p) as f:
+            data = json.load(f)
+        for v in data.values():
+            r = v["roi"]
+            roi_ids.add(r[0] if isinstance(r, list) else r)
+    return roi_ids
+
+
 def download_roi_worker(roi_batch):
     """Worker function for parallel ROI downloads"""
     data_dir = Path("data")
@@ -259,6 +273,15 @@ def main():
     spatial.add_argument('--bbox', type=float, nargs=4,
                          metavar=('LAT_MIN', 'LON_MIN', 'LAT_MAX', 'LON_MAX'),
                          help='Download only ROIs within bounding box')
+    # Sample-driven filter: restrict to ROIs referenced by dataset JSON(s).
+    parser.add_argument('--from-json', nargs='+', metavar='JSON',
+                        help='Download only ROIs referenced by these dataset JSON(s), e.g. '
+                             'metadata/datasets/train_tx3_s2-s1_10pct.json. Note: pct subsets '
+                             'are sampled per-sequence, so 10%% of samples still spans ~72%% of '
+                             'ROIs. Intersects with any spatial filter.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Resolve the ROI list, print count + estimated size, then exit '
+                             '(downloads nothing).')
     args = parser.parse_args()
 
     n_cores = max(1, args.cpus - 1)
@@ -297,6 +320,18 @@ def main():
     print("\n==> Step 2/2: Loading ROI list...")
     roi_ids = load_roi_list(bbox=bbox, biomes=biomes)
     print(f"Found {len(roi_ids):,} unique ROI IDs")
+
+    if args.from_json:
+        json_rois = rois_from_json(args.from_json)
+        roi_ids = sorted(set(roi_ids) & json_rois)
+        print(f"JSON filter ({len(args.from_json)} file(s)): {len(json_rois):,} referenced "
+              f"→ {len(roi_ids):,} to download")
+
+    if args.dry_run:
+        gb = len(roi_ids) * AVG_MB_PER_ROI / 1024
+        print(f"\n[dry-run] {len(roi_ids):,} ROIs ≈ {gb:,.0f} GB ({gb / 1024:.2f} TB) "
+              f"at ~{AVG_MB_PER_ROI} MB/ROI. Nothing downloaded.")
+        return
 
     chunk_size = len(roi_ids) // n_cores + 1
     roi_chunks = [roi_ids[i:i + chunk_size] for i in range(0, len(roi_ids), chunk_size)]
