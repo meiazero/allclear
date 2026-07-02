@@ -180,8 +180,7 @@ class AllClearDataset(Dataset):
             for sensor_input in sensor_inputs:
                 timestamp, fpath = sensor_input
                 timestamp = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                if not os.path.exists(
-                        fpath):  # Add this line to handle the case when the script is not running on Sun / Bala's server
+                if not os.path.exists(fpath):
                     fpath = fpath.replace("/scratch/allclear/dataset_v3/",
                                           "/share/hariharan/cloud_removal/MultiSensor/")
                 image = self.load_and_center_crop(fpath, self.channels[sensor], self.center_crop_size)
