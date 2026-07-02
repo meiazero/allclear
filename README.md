@@ -88,13 +88,34 @@ metadata/
 |---|---|
 | `split` | `train`, `val`, `test` |
 | `sequence_length` | `tx3` (3 frames), `tx12` (12 frames) |
-| `sensors` | `s2-s1`, `s2-s1-landsat` |
+| `sensors` | `s2-s1`, `s2-s1-landsat`, `s2` (S2-only, derived — see below) |
 | `pct_data` | `100pct`, `10pct`, `3.4pct`, `1pct` |
 | `1proi` | single-patch-per-ROI lightweight subset |
 
 Runtime tokens (not in file names): `s2p` (seq2point, predict one clear target
 frame) / `s2s` (seq2seq) = the loader `target_mode`; `tx` = input sequence
 length; `stp` = spatio-temporal-patch, the only supported loader `format`.
+
+### Sentinel-2-only subsets
+
+The shipped JSONs always bundle S1 (and sometimes Landsat). For an **S2-only**
+experiment, derive stripped copies with `make_s2_only.py`. It empties every
+non-S2 modality (`s1`, `landsat8`, `landsat9`) per sample, keeps `s2_toa` /
+`target` / `roi`, and rewrites the `sensors` tag to `s2`:
+
+```bash
+uv run python make_s2_only.py \
+    metadata/datasets/train_tx3_s2-s1_100pct.json \
+    metadata/datasets/test_tx3_s2-s1_100pct.json \
+    metadata/datasets/val_tx3_s2-s1-landsat_100pct.json
+# → train_tx3_s2_100pct.json  test_tx3_s2_100pct.json  val_tx3_s2_100pct.json
+```
+
+The loader treats an empty modality list like an absent one (≈40% of samples
+already ship with empty `s1`), so the output trains/vals/tests directly. Like
+all of `metadata/`, the derived JSONs are **not versioned** — regenerate them
+after downloading metadata. Note: `val` only ships as the `s2-s1-landsat`
+variant, so derive it from that file.
 
 ## Data dictionary
 
