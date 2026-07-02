@@ -1,4 +1,5 @@
 import os
+import re
 import copy
 from datetime import datetime
 import numpy as np
@@ -67,6 +68,7 @@ class AllClearDataset(Dataset):
                  s2_toa_channels=None,
                  max_diff=2,
                  s1_preprocess_mode="default",
+                 data_root="data",
                  ):
         if aux_sensors is None:
             aux_sensors = []
@@ -86,6 +88,7 @@ class AllClearDataset(Dataset):
         self.target_mode = target_mode
         self.max_diff = max_diff
         self.s1_preprocess_mode = s1_preprocess_mode
+        self.data_root = data_root
         if self.format != "stp":
             raise ValueError("The format is not supported.")
 
@@ -111,6 +114,30 @@ class AllClearDataset(Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+    def _resolve(self, fpath):
+        """Map a dataset-JSON path to a file that exists locally.
+
+        The dataset JSONs store absolute paths from the authors' cluster
+        (``/scratch/allclear/dataset_v3/dataset_30k_v4/roiXXXX/...``), while
+        ``download.py`` extracts each ROI archive under ``data_root`` as
+        ``roiXXXX/...``. Resolution order: (1) the path as-is (original
+        cluster / caller passed a local path), (2) rebased onto ``data_root``
+        by the ``roiXXXX/...`` tail, (3) the legacy Cornell ``/share`` layout.
+        Falls through to the original path so the caller's own existence check
+        raises a clear error.
+        """
+        if os.path.exists(fpath):
+            return fpath
+        if self.data_root is not None:
+            m = re.search(r"roi\d+/.*$", fpath)
+            if m:
+                candidate = os.path.join(self.data_root, m.group(0))
+                if os.path.exists(candidate):
+                    return candidate
+        alt = fpath.replace("/scratch/allclear/dataset_v3/",
+                            "/share/hariharan/cloud_removal/MultiSensor/")
+        return alt if os.path.exists(alt) else fpath
 
     @staticmethod
     def load_and_center_crop(fpath, channels=None, size=(256, 256)):
@@ -172,7 +199,11 @@ class AllClearDataset(Dataset):
 
         # load in images as lists of (timestamp, image) pairs (also load in cloud and shadow masks for main sensor)
         inputs = {sensor: [] for sensor in
-                  self.sensors + ["input_cld_shdw", "input_dw", "target_cld_shdw", "target_dw"]}
+                  self.sensors + ["input_cld_shdw", "input_dw"]}
+        # s2p reassigns these to tensors below; s2s leaves them as None so the
+        # output builder drops them (a [] here would hit list.permute() -> crash).
+        inputs["target_cld_shdw"] = None
+        inputs["target_dw"] = None
         timestamps = []
 
         for sensor in self.sensors:
@@ -180,9 +211,7 @@ class AllClearDataset(Dataset):
             for sensor_input in sensor_inputs:
                 timestamp, fpath = sensor_input
                 timestamp = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                if not os.path.exists(fpath):
-                    fpath = fpath.replace("/scratch/allclear/dataset_v3/",
-                                          "/share/hariharan/cloud_removal/MultiSensor/")
+                fpath = self._resolve(fpath)
                 image = self.load_and_center_crop(fpath, self.channels[sensor], self.center_crop_size)
                 image = self.preprocess(image, sensor)
                 inputs[sensor].append((timestamp, image))
@@ -231,9 +260,7 @@ class AllClearDataset(Dataset):
             if "target" not in sample.keys():
                 raise ValueError("Target is not available in the sample.")
             timestamp, fpath = sample["target"][0]
-            if not os.path.exists(
-                    fpath):  # Add this line to handle the case when the script is not running on Sun / Bala's server
-                fpath = fpath.replace("/scratch/allclear/dataset_v3/", "/share/hariharan/cloud_removal/MultiSensor/")
+            fpath = self._resolve(fpath)
             image = self.load_and_center_crop(fpath, self.channels[self.main_sensor], self.center_crop_size)
             image = self.preprocess(image, self.main_sensor)  # target by default is the main sensor
             inputs["target"] = [(timestamp, image)]
