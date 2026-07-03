@@ -4,7 +4,7 @@
 # os ROIs já extraídos (data/<roi>/ existe) e baixa só o que falta.
 #
 #SBATCH -J allclear-dl
-#SBATCH -p gpuq                    # TODO: se houver partição CPU-only, troca aqui (sinfo -s). Não usa GPU.
+#SBATCH -p cpuq                    # CPU-only: download é rede+disco, não usa GPU
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=16G
 #SBATCH --time=2-00:00:00          # ~2,2 TB restantes; ajusta se a partição tiver teto menor
