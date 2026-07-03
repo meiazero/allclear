@@ -25,14 +25,15 @@ CHUNK_SIZE = 8192
 AVG_MB_PER_ROI = 184  # ponytail: measured median of sampled ROI archives; --dry-run estimate only
 
 def download_file(url, dest_path, show_progress=True):
-    """Download a file with progress bar and return success status"""
+    """Download a file. Returns 'ok', 'notfound' (real 404) or 'error' (connection/timeout/HTTP)."""
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=30)
         if response.status_code == 404:
-            return False
+            return 'notfound'
+        response.raise_for_status()
 
         total_size = int(response.headers.get("content-length", 0))
-        
+
         with open(dest_path, "wb") as f:
             if show_progress:
                 with tqdm(total=total_size, unit='B', unit_scale=True, desc=dest_path.name) as pbar:
@@ -44,12 +45,11 @@ def download_file(url, dest_path, show_progress=True):
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
-        return True
-    except Exception as e:
-        print(f"Error downloading {url}: {e}")
+        return 'ok'
+    except Exception:
         if dest_path.exists():
             dest_path.unlink()
-        return False
+        return 'error'
 
 def verify_file(file_path):
     """Verify if file is complete by trying to open it"""
@@ -70,16 +70,16 @@ def download_metadata():
     url = f"{BASE_URL}/{filename}"
     dest_path = metadata_dir / filename
     print(f"Downloading metadata from {url} to {dest_path}")
-    success = download_file(url, dest_path)
+    status = download_file(url, dest_path)
 
-    if success and verify_file(dest_path):
+    if status == 'ok' and verify_file(dest_path):
         # Extract the tar.gz file
         try:
             import tarfile
             import shutil
 
             with tarfile.open(dest_path, 'r:gz') as tar:
-                tar.extractall(path=metadata_dir)
+                tar.extractall(path=metadata_dir, filter='data')
 
             nested_dir = metadata_dir / "metadata"
             if nested_dir.exists() and nested_dir.is_dir():
@@ -93,11 +93,11 @@ def download_metadata():
             print(f"Error extracting {filename}: {e}")
             if dest_path.exists():
                 dest_path.unlink()
-    elif success:
+    elif status == 'ok':
         print(f"Downloaded {filename} but verification failed")
         dest_path.unlink()
     else:
-        print(f"Skipping {filename} - not found on server")
+        print(f"Skipping {filename} - {status} ({url})")
 
 
 def load_roi_list(bbox=None, biomes=None):
@@ -202,46 +202,42 @@ def rois_from_json(json_paths):
     return roi_ids
 
 
-def download_roi_worker(roi_batch):
-    """Worker function for parallel ROI downloads"""
+def download_one_roi(roi_id):
+    """Download+extract one ROI. Returns (roi_id, status): 'ok'|'skip'|'notfound'|'error'.
+
+    Silent by design: the parent process owns the single progress bar and the
+    summary, so workers just report status instead of printing per-ROI.
+    """
     data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
-    
-    for roi_id in roi_batch:
-        filename = f"{roi_id}.tar.gz"
-        dest_path = data_dir / filename
-        url = f"{BASE_URL}/data/{filename}"
-        
-        # Skip if already downloaded, verified, and extracted
-        if (data_dir / roi_id).exists():
-            continue
-            
-        # Remove if exists but invalid
-        if dest_path.exists():
+    dest_path = data_dir / f"{roi_id}.tar.gz"
+    url = f"{BASE_URL}/data/{roi_id}.tar.gz"
+
+    # Already downloaded, verified, and extracted → skip
+    if (data_dir / roi_id).exists():
+        return roi_id, "skip"
+
+    # Leftover partial archive from an interrupted run → drop it
+    if dest_path.exists():
+        dest_path.unlink()
+
+    status = download_file(url, dest_path, show_progress=False)
+    time.sleep(0.1)
+
+    if status == "ok" and verify_file(dest_path):
+        try:
+            import tarfile
+            with tarfile.open(dest_path, "r:gz") as tar:
+                tar.extractall(path=data_dir, filter="data")
             dest_path.unlink()
-            
-        # Download file
-        success = download_file(url, dest_path, show_progress=False)
-        time.sleep(0.1)
-        
-        if success and verify_file(dest_path):
-            # Extract the tar.gz file
-            try:
-                import tarfile
-                with tarfile.open(dest_path, 'r:gz') as tar:
-                    tar.extractall(path=data_dir)
-                print(f"Successfully downloaded and extracted {filename}")
-                # Remove the tar.gz file after extraction
+            return roi_id, "ok"
+        except Exception:
+            if dest_path.exists():
                 dest_path.unlink()
-            except Exception as e:
-                print(f"Error extracting {filename}: {e}")
-                if dest_path.exists():
-                    dest_path.unlink()
-        elif success:
-            print(f"Downloaded {filename} but verification failed")
-            dest_path.unlink()
-        else:
-            print(f"Skipping {filename} - not found on server")
+            return roi_id, "error"
+
+    if dest_path.exists():
+        dest_path.unlink()
+    return roi_id, status if status != "ok" else "error"
 
 def main():
     parser = argparse.ArgumentParser(
@@ -333,14 +329,29 @@ def main():
               f"at ~{AVG_MB_PER_ROI} MB/ROI. Nothing downloaded.")
         return
 
-    chunk_size = len(roi_ids) // n_cores + 1
-    roi_chunks = [roi_ids[i:i + chunk_size] for i in range(0, len(roi_ids), chunk_size)]
+    data_dir = Path("data")
+    data_dir.mkdir(exist_ok=True)
+    print(f"Downloading {len(roi_ids):,} ROIs using {n_cores} processes...")
 
-    print(f"Downloading ROIs using {n_cores} processes...")
+    tally = {"ok": 0, "skip": 0, "notfound": 0, "error": 0}
+    failed = []
     with mp.Pool(n_cores) as pool:
-        pool.map(download_roi_worker, roi_chunks)
+        with tqdm(total=len(roi_ids), unit="roi") as bar:
+            for roi_id, status in pool.imap_unordered(download_one_roi, roi_ids):
+                tally[status] += 1
+                if status in ("notfound", "error"):
+                    failed.append((roi_id, status))
+                bar.update(1)
+                bar.set_postfix(ok=tally["ok"], skip=tally["skip"],
+                                miss=tally["notfound"], err=tally["error"])
 
-    print("\nDownload completed!")
+    print(f"\nDone. downloaded={tally['ok']:,}  already={tally['skip']:,}  "
+          f"missing={tally['notfound']:,}  errors={tally['error']:,}")
+    if failed:
+        fp = Path("failed_rois.txt")
+        fp.write_text("\n".join(f"{r}\t{s}" for r, s in failed))
+        print(f"{len(failed):,} failed → {fp}. Rerun the same command to retry "
+              f"(errors are usually transient network; 'notfound' = truly absent on server).")
 
 if __name__ == "__main__":
     main()
