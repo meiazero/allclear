@@ -18,13 +18,14 @@ Cite as:
 """
 
 import hashlib
-import unicodedata
 import zipfile
 from pathlib import Path
 
 import geopandas as gpd
 import requests
 from tqdm import tqdm
+
+from biomes import normalize_name
 
 IBGE_URL = (
     "https://geoftp.ibge.gov.br/informacoes_ambientais/estudos_ambientais/"
@@ -35,15 +36,6 @@ ZIP_PATH = DEST_DIR / "Biomas_250mil.zip"
 GPKG_PATH = DEST_DIR / "biomas_wgs84.gpkg"
 HASH_PATH = DEST_DIR / ".sha256"
 CHUNK_SIZE = 8192
-
-
-def normalize_name(name: str) -> str:
-    """Remove accents, lowercase, replace spaces with underscores.
-    e.g. 'Amazônia' -> 'amazonia', 'Mata Atlântica' -> 'mata_atlantica'
-    """
-    nfkd = unicodedata.normalize("NFKD", str(name))
-    ascii_str = nfkd.encode("ASCII", "ignore").decode("ASCII")
-    return ascii_str.lower().replace(" ", "_").replace("-", "_")
 
 
 def sha256_file(path: Path) -> str:
@@ -57,15 +49,15 @@ def sha256_file(path: Path) -> str:
 def download_zip():
     DEST_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Downloading IBGE biomes shapefile from:\n  {IBGE_URL}\n")
-    response = requests.get(IBGE_URL, stream=True)
-    response.raise_for_status()
-    total = int(response.headers.get("content-length", 0))
-    with open(ZIP_PATH, "wb") as f:
-        with tqdm(total=total, unit="B", unit_scale=True, desc="Biomas_250mil.zip") as pbar:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    f.write(chunk)
-                    pbar.update(len(chunk))
+    with requests.get(IBGE_URL, stream=True) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+        with open(ZIP_PATH, "wb") as f:
+            with tqdm(total=total, unit="B", unit_scale=True, desc="Biomas_250mil.zip") as pbar:
+                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+                        pbar.update(len(chunk))
 
 
 def verify_or_record_hash():

@@ -16,15 +16,10 @@ Usage:
 
 import argparse
 import json
-import unicodedata
 from pathlib import Path
 
-import geopandas as gpd
-import pandas as pd
-from shapely.geometry import Point
+from biomes import load_biome_rois, normalize_name
 
-GPKG_PATH = Path("metadata/shapefiles/biomas_wgs84.gpkg")
-ROIS_CSV = Path("metadata/rois/rois_metadata.csv")
 DATASETS_DIR = Path("metadata/datasets")
 ROIS_DIR = Path("metadata/rois")
 
@@ -33,58 +28,9 @@ ALL_SENSORS = ["s2_toa", "s1", "landsat8", "landsat9"]
 DEFAULT_SENSORS = ["s2_toa"]
 
 
-def normalize_name(name: str) -> str:
-    nfkd = unicodedata.normalize("NFKD", str(name))
-    ascii_str = nfkd.encode("ASCII", "ignore").decode("ASCII")
-    return ascii_str.lower().replace(" ", "_").replace("-", "_")
-
-
 def make_suffix(biomes: list[str]) -> str:
     """Short suffix from biome names: ['amazonia', 'cerrado'] -> 'amz-cer'"""
     return "-".join(b[:3] for b in sorted(biomes))
-
-
-def load_biome_rois(biomes: list[str]) -> set[str]:
-    """Spatial join: return set of roi_ids (e.g. 'roi245610') in selected biomes."""
-    if not GPKG_PATH.exists():
-        raise FileNotFoundError(
-            f"{GPKG_PATH} not found. Run download_shapefile.py first."
-        )
-    if not ROIS_CSV.exists():
-        raise FileNotFoundError(
-            f"{ROIS_CSV} not found. Run download.py (metadata step) first."
-        )
-
-    print("Loading biomes shapefile...")
-    biomes_gdf = gpd.read_file(GPKG_PATH)
-    selected = biomes_gdf[biomes_gdf["biome"].isin(biomes)].copy()
-    if selected.empty:
-        available = sorted(biomes_gdf["biome"].unique())
-        raise ValueError(
-            f"No biomes matched {biomes}.\nAvailable: {available}"
-        )
-
-    print(f"Loading ROI centroids ({ROIS_CSV})...")
-    rois_df = pd.read_csv(ROIS_CSV)
-    rois_gdf = gpd.GeoDataFrame(
-        rois_df,
-        geometry=[Point(float(row.longitude), float(row.latitude)) for row in rois_df.itertuples()],
-        crs="EPSG:4326",
-    )
-
-    print("Running spatial join (point-in-polygon)...")
-    joined = gpd.sjoin(rois_gdf, selected[["biome", "geometry"]], how="inner", predicate="within")
-
-    roi_ids = set("roi" + str(rid) for rid in joined["roi_id"].astype(str))
-
-    # Report per biome
-    print(f"\nROIs per biome:")
-    for biome in sorted(biomes):
-        count = joined[joined["biome"] == biome].shape[0]
-        print(f"  {biome}: {count:,}")
-    print(f"  TOTAL: {len(roi_ids):,} ROIs\n")
-
-    return roi_ids
 
 
 def filter_sample(sample: dict, keep_sensors: list[str]) -> dict:

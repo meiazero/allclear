@@ -1,23 +1,19 @@
-import csv
-import unicodedata
-import requests
-from pathlib import Path
-import multiprocessing as mp
-from tqdm import tqdm
-import time
 import argparse
+import csv
+import gzip
+import multiprocessing as mp
+import time
+from pathlib import Path
+
+import requests
+from tqdm import tqdm
+
+from biomes import load_biome_rois, normalize_name
 
 # Brazil bounding box
 BRAZIL_BBOX = (-33.75, -73.99, 5.27, -28.85)  # (lat_min, lon_min, lat_max, lon_max)
 
-GPKG_PATH = Path("metadata/shapefiles/biomas_wgs84.gpkg")
 ROIS_CSV = Path("metadata/rois/rois_metadata.csv")
-
-
-def normalize_name(name: str) -> str:
-    nfkd = unicodedata.normalize("NFKD", str(name))
-    ascii_str = nfkd.encode("ASCII", "ignore").decode("ASCII")
-    return ascii_str.lower().replace(" ", "_").replace("-", "_")
 
 # Configuration
 BASE_URL = "http://allclear.cs.cornell.edu/dataset/allclear"
@@ -27,24 +23,24 @@ AVG_MB_PER_ROI = 184  # ponytail: measured median of sampled ROI archives; --dry
 def download_file(url, dest_path, show_progress=True):
     """Download a file. Returns 'ok', 'notfound' (real 404) or 'error' (connection/timeout/HTTP)."""
     try:
-        response = requests.get(url, stream=True, timeout=30)
-        if response.status_code == 404:
-            return 'notfound'
-        response.raise_for_status()
+        with requests.get(url, stream=True, timeout=30) as response:
+            if response.status_code == 404:
+                return 'notfound'
+            response.raise_for_status()
 
-        total_size = int(response.headers.get("content-length", 0))
+            total_size = int(response.headers.get("content-length", 0))
 
-        with open(dest_path, "wb") as f:
-            if show_progress:
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=dest_path.name) as pbar:
+            with open(dest_path, "wb") as f:
+                if show_progress:
+                    with tqdm(total=total_size, unit='B', unit_scale=True, desc=dest_path.name) as pbar:
+                        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                            if chunk:
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+                else:
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                         if chunk:
                             f.write(chunk)
-                            pbar.update(len(chunk))
-            else:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
         return 'ok'
     except Exception:
         if dest_path.exists():
@@ -52,14 +48,13 @@ def download_file(url, dest_path, show_progress=True):
         return 'error'
 
 def verify_file(file_path):
-    """Verify if file is complete by trying to open it"""
+    """Verify a file is complete by opening it (gzip archives only)."""
     try:
         if file_path.suffix == '.gz':
-            import gzip
             with gzip.open(file_path, 'rb') as f:
-                f.read(1)  # Try reading first byte
+                f.read(1)  # try reading first byte
         return True
-    except:
+    except (OSError, EOFError, gzip.BadGzipFile):
         return False
 
 def download_metadata():
@@ -130,42 +125,8 @@ def load_roi_list(bbox=None, biomes=None):
 
 
 def _filter_by_biomes(roi_ids: set, biomes: list) -> list:
-    """Filter ROIs using the IBGE biomes shapefile (point-in-polygon)."""
-    try:
-        import geopandas as gpd
-        import pandas as pd
-        from shapely.geometry import Point
-    except ImportError:
-        raise ImportError("geopandas required for --biomes. Run: uv add geopandas")
-
-    if not GPKG_PATH.exists():
-        raise FileNotFoundError(
-            f"{GPKG_PATH} not found. Run download_shapefile.py first."
-        )
-    if not ROIS_CSV.exists():
-        raise FileNotFoundError(f"{ROIS_CSV} not found.")
-
-    print(f"Loading biomes shapefile for: {biomes}")
-    biomes_gdf = gpd.read_file(GPKG_PATH)
-    selected = biomes_gdf[biomes_gdf["biome"].isin(biomes)]
-    if selected.empty:
-        available = sorted(biomes_gdf["biome"].unique())
-        raise ValueError(f"No biomes matched {biomes}.\nAvailable: {available}")
-
-    rois_df = pd.read_csv(ROIS_CSV)
-    rois_gdf = gpd.GeoDataFrame(
-        rois_df,
-        geometry=[Point(float(r.longitude), float(r.latitude)) for r in rois_df.itertuples()],
-        crs="EPSG:4326",
-    )
-
-    joined = gpd.sjoin(rois_gdf, selected[["biome", "geometry"]], how="inner", predicate="within")
-    biome_roi_ids = set("roi" + str(rid) for rid in joined["roi_id"].astype(str))
-
-    result = sorted(roi_ids & biome_roi_ids)
-    for biome in sorted(biomes):
-        count = joined[joined["biome"] == biome].shape[0]
-        print(f"  {biome}: {count:,} ROIs")
+    """Filter ROIs to those whose centroid falls inside the selected biomes."""
+    result = sorted(roi_ids & load_biome_rois(biomes))
     print(f"Biome filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
     return result
 
