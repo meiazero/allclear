@@ -186,9 +186,18 @@ def download_one_roi(roi_id):
 
     if status == "ok" and verify_file(dest_path):
         try:
+            import shutil
             import tarfile
+            # Extract to a staging dir + atomic rename: data/<roi>/ only ever appears
+            # complete, so the "dir exists -> skip" check above stays trustworthy even
+            # if the process dies mid-extraction.
+            tmp_dir = data_dir / f".extract_{roi_id}"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
             with tarfile.open(dest_path, "r:gz") as tar:
-                tar.extractall(path=data_dir, filter="data")
+                tar.extractall(path=tmp_dir, filter="data")
+            (tmp_dir / roi_id).rename(data_dir / roi_id)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             dest_path.unlink()
             return roi_id, "ok"
         except Exception:
