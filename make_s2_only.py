@@ -19,6 +19,10 @@ import re
 from pathlib import Path
 
 KEEP = {"roi", "target", "s2_toa"}  # everything else is a non-S2 modality
+# Derived splits land here, NOT in metadata/datasets/: that directory is AllClear's own
+# shipped metadata, re-extracted from metadata.tar.gz on every download_metadata(). Keeping
+# ours apart makes "shipped" vs "ours" a directory question, not a filename question.
+OUT_DIR = Path("metadata/lnlm")
 
 
 def s2_only(src: Path) -> Path:
@@ -27,9 +31,11 @@ def s2_only(src: Path) -> Path:
         for key in sample:  # reassign in place; no keys added/removed
             if key not in KEEP:
                 sample[key] = []
-    dst = src.with_name(re.sub(r"s2-s1(-landsat)?", "s2", src.name))
-    if dst == src:
+    name = re.sub(r"s2-s1(-landsat)?", "s2", src.name)
+    if name == src.name:
         raise ValueError(f"{src.name}: no 's2-s1[-landsat]' tag to rewrite")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    dst = OUT_DIR / name
     dst.write_text(json.dumps(data))
     return dst
 
