@@ -22,7 +22,7 @@ KEEP = {"roi", "target", "s2_toa"}  # everything else is a non-S2 modality
 # Derived splits land here, NOT in metadata/datasets/: that directory is AllClear's own
 # shipped metadata, re-extracted from metadata.tar.gz on every download_metadata(). Keeping
 # ours apart makes "shipped" vs "ours" a directory question, not a filename question.
-OUT_DIR = Path("metadata/lnlm")
+OUT_DIR = Path("metadata/derived")
 
 
 def s2_only(src: Path) -> Path:

@@ -11,3 +11,20 @@ dependencies = [
   "torch>=2.13.0",
   "tqdm>=4.68.4",
 ]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+# Upstream AllClear code keeps its own style; the scripts at the root are linted.
+extend-exclude = ["allclear", "baselines", "dataset_construction", "demos", "setup.py"]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "C4", "PTH", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
