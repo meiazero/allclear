@@ -247,3 +247,8 @@ uv run python -m allclear.benchmark \
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Checks before push
+
+Run `git config core.hooksPath .githooks` once per clone. `.githooks/pre-push` then
+refuses a push that fails `uvx ruff format --check .` or `uvx ruff check .`.
