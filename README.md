@@ -28,39 +28,75 @@ uv sync
 
 ## Dataset Download
 
-The download is split into independent steps. Step 1 (metadata) is required
-before step 2. ROI archives are extracted under `./data/`; already-present ROIs
-are skipped.
+The data is not kept in the repository: every action takes `--dir`, the directory where
+the dataset is created and saved (`<dir>/metadata`, `<dir>/data/roiXXXX/…`).
 
 ```bash
-# Step 1 — metadata (required first, ~few MB)
-uv run python download.py --metadata-only
+uv sync && uv run pytest -q && uvx ruff check .
 
-# Step 2 — ROI images (the full dataset, ~4 TB)
-uv run python download.py --data-only
+# 1. metadata + ROI images + verify (the full dataset, ~4 TB); needs internet, so on a
+#    cluster run it on the login node
+nohup uv run python -u download.py download --dir /path/to/allclear \
+    > download.log 2>&1 &
 
-# Or run both at once
-uv run python download.py
+# 2. compact + verify: CPU work (SLURM example; SLURM only launches the script)
+mkdir -p logs
+sbatch -p <cpu partition> -c 64 --mem=64G --time=2-00:00:00 -o logs/%x_%j.out -J allclear-prepare \
+    --wrap "uv run python -u download.py prepare --dir /path/to/allclear --workers 64"
+
+# verify only
+uv run python download.py verify --dir /path/to/allclear
 ```
 
-Optional filters (combine with `--data-only`):
+Every action is resumable: re-run the same command after a failure or timeout. Archives
+are fetched with HTTP Range into `.part` files and extracted into a staging directory, so
+`data/roiXXXX/` only exists when complete. Each action ends with verify (every raster the
+sample lists need for the selected ROIs, plus a deep read of 500 random ones) and exits 0
+only when that step had no failure and verify passes; the report is
+`<dir>/verify_report.json`.
+
+Optional filters (same flags on `download` and `verify`):
 
 ```bash
 # Only ROIs referenced by a given dataset JSON
-uv run python download.py --data-only \
-    --from-json metadata/datasets/train_tx3_s2-s1_10pct.json
+uv run python download.py download --dir <dir> \
+    --from-json <dir>/metadata/datasets/train_tx3_s2-s1_10pct.json
 
-# Only ROIs within a bounding box (LAT_MIN LON_MIN LAT_MAX LON_MAX)
-uv run python download.py --data-only --bbox <lat_min> <lon_min> <lat_max> <lon_max>
+# Only ROIs within a bounding box (LAT_MIN LON_MIN LAT_MAX LON_MAX), Brazil, or biomes
+uv run python download.py download --dir <dir> --bbox <lat_min> <lon_min> <lat_max> <lon_max>
+uv run python download.py download --dir <dir> --brazil
+uv run python download_shapefile.py --dir <dir>   # once, for --biomes
+uv run python download.py download --dir <dir> --biomes amazonia cerrado
 
-# Resolve the ROI list and print a size estimate without downloading anything
-uv run python download.py --data-only --dry-run
+# Resolve the ROI list and print a size estimate without downloading any ROI
+uv run python download.py download --dir <dir> --dry-run
 ```
+
+`prepare` rewrites every GeoTIFF in place as tiled (256 × 256) ZSTD with a predictor, in the
+smallest dtype that holds every value at float32 precision (`uint8`, `uint16`, `int16`,
+`float32`); the file is read back and compared before it replaces the original. The dtype can
+differ between files of the same sensor (an S2 composite with `.5` values stays `float32`),
+so readers must cast (`src.read().astype(np.float32)`).
+
+Why: AllClear ships float64 rasters, already ZSTD-compressed. On 12 random ROIs (one-off
+measurement on 2026-09-24) disk size drops little (S2 −4 %, Landsat −16 %, S1 −59 %), but
+decoding, which a DataLoader pays for, gets 6–12× faster:
+
+| Sensor | Read, float64 as shipped | Read, float32 ZSTD + predictor |
+|---|---|---|
+| `s2_toa` | 34.5 ms | 5.5 ms |
+| `landsat8/9` | 30–33 ms | 4.3–4.4 ms |
+| `s1` | 20.0 ms | 1.6 ms |
+
+S1 is the only sensor whose float64 values are not exact in float32 (relative change
+≤ 6e-8).
+`common.py` is an identical copy of the one in
+[meiazero/sen12mscrts](https://github.com/meiazero/sen12mscrts).
 
 ## Metadata structure
 
 ```
-metadata/
+<dir>/metadata/
 ├── data/
 │   ├── dw_metadata.csv
 │   ├── landsat8_metadata.csv
@@ -104,11 +140,11 @@ non-S2 modality (`s1`, `landsat8`, `landsat9`) per sample, keeps `s2_toa` /
 `target` / `roi`, and rewrites the `sensors` tag to `s2`:
 
 ```bash
-uv run python make_s2_only.py \
-    metadata/datasets/train_tx3_s2-s1_100pct.json \
-    metadata/datasets/test_tx3_s2-s1_100pct.json \
-    metadata/datasets/val_tx3_s2-s1-landsat_100pct.json
-# → train_tx3_s2_100pct.json  test_tx3_s2_100pct.json  val_tx3_s2_100pct.json
+uv run python make_s2_only.py --dir <dir> \
+    <dir>/metadata/datasets/train_tx3_s2-s1_100pct.json \
+    <dir>/metadata/datasets/test_tx3_s2-s1_100pct.json \
+    <dir>/metadata/datasets/val_tx3_s2-s1-landsat_100pct.json
+# → <dir>/metadata/derived/{train,test,val}_tx3_s2_100pct.json
 ```
 
 The loader treats an empty modality list like an absent one (≈40% of samples
@@ -177,11 +213,12 @@ replacing `s2_toa` with `cld_shdw`/`dw` in the tile path. `target` is present fo
 
 The tile paths inside the JSONs are absolute to the authors' cluster
 (`/scratch/allclear/dataset_v3/dataset_30k_v4/roiXXXX/…`), but `download.py`
-extracts ROI archives to `./data/roiXXXX/…`. The loader rebases them
+extracts ROI archives to `<dir>/data/roiXXXX/…`. The loader rebases them
 automatically via the `data_root` argument (default `"data"`):
 
 ```python
 from allclear.dataset import AllClearDataset
+
 ds = AllClearDataset(dataset, selected_rois="all", data_root="data")
 ```
 

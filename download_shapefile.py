@@ -6,8 +6,11 @@ Source:
   Biomas do Brasil - Escala 1:250.000 (2019)
   https://geoftp.ibge.gov.br/informacoes_ambientais/estudos_ambientais/biomas/vetores/
 
+Usage:
+  python download_shapefile.py --dir <dir>   # same --dir as download.py
+
 Output:
-  metadata/shapefiles/biomas_wgs84.gpkg  — reprojected to WGS84 (EPSG:4326)
+  <dir>/metadata/shapefiles/biomas_wgs84.gpkg  — reprojected to WGS84 (EPSG:4326)
                                            with normalized biome name column
 
 Cite as:
@@ -17,6 +20,7 @@ Cite as:
   estudos-ambientais/15842-biomas.html
 """
 
+import argparse
 import hashlib
 import zipfile
 from pathlib import Path
@@ -31,39 +35,40 @@ IBGE_URL = (
     "https://geoftp.ibge.gov.br/informacoes_ambientais/estudos_ambientais/"
     "biomas/vetores/Biomas_250mil.zip"
 )
-DEST_DIR = Path("metadata/shapefiles")
-ZIP_PATH = DEST_DIR / "Biomas_250mil.zip"
-GPKG_PATH = DEST_DIR / "biomas_wgs84.gpkg"
-HASH_PATH = DEST_DIR / ".sha256"
+ZIP_NAME = "Biomas_250mil.zip"
+GPKG_NAME = "biomas_wgs84.gpkg"
+HASH_NAME = ".sha256"
 CHUNK_SIZE = 8192
 
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with path.open("rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def download_zip():
-    DEST_DIR.mkdir(parents=True, exist_ok=True)
+def download_zip(dest: Path):
+    dest.mkdir(parents=True, exist_ok=True)
     print(f"Downloading IBGE biomes shapefile from:\n  {IBGE_URL}\n")
     with requests.get(IBGE_URL, stream=True) as response:
         response.raise_for_status()
         total = int(response.headers.get("content-length", 0))
-        with open(ZIP_PATH, "wb") as f:
-            with tqdm(total=total, unit="B", unit_scale=True, desc="Biomas_250mil.zip") as pbar:
-                for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        pbar.update(len(chunk))
+        with (
+            (dest / ZIP_NAME).open("wb") as f,
+            tqdm(total=total, unit="B", unit_scale=True, desc=ZIP_NAME) as pbar,
+        ):
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
+                    f.write(chunk)
+                    pbar.update(len(chunk))
 
 
-def verify_or_record_hash():
-    digest = sha256_file(ZIP_PATH)
-    if HASH_PATH.exists():
-        saved = HASH_PATH.read_text().strip()
+def verify_or_record_hash(dest: Path):
+    digest = sha256_file(dest / ZIP_NAME)
+    if (dest / HASH_NAME).exists():
+        saved = (dest / HASH_NAME).read_text().strip()
         if digest != saved:
             raise RuntimeError(
                 f"SHA256 mismatch!\n  expected: {saved}\n  got:      {digest}\n"
@@ -71,18 +76,18 @@ def verify_or_record_hash():
             )
         print(f"SHA256 verified: {digest}")
     else:
-        HASH_PATH.write_text(digest + "\n")
-        print(f"\n{'='*60}")
+        (dest / HASH_NAME).write_text(digest + "\n")
+        print(f"\n{'=' * 60}")
         print(f"SHA256 (record this for your paper):\n  {digest}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
 
-def extract_and_reproject():
-    extract_dir = DEST_DIR / "raw"
+def extract_and_reproject(dest: Path):
+    extract_dir = dest / "raw"
     extract_dir.mkdir(exist_ok=True)
 
     print("Extracting zip...")
-    with zipfile.ZipFile(ZIP_PATH) as zf:
+    with zipfile.ZipFile(dest / ZIP_NAME) as zf:
         zf.extractall(extract_dir)
 
     # Find the .shp file
@@ -109,30 +114,33 @@ def extract_and_reproject():
     gdf["biome"] = gdf[name_col].apply(normalize_name)
     gdf = gdf[["biome", "geometry"]].copy()
 
-    gdf.to_file(GPKG_PATH, driver="GPKG")
-    print(f"Saved: {GPKG_PATH}")
+    gdf.to_file(dest / GPKG_NAME, driver="GPKG")
+    print(f"Saved: {dest / GPKG_NAME}")
     return gdf
 
 
 def main():
-    if GPKG_PATH.exists() and HASH_PATH.exists():
-        print(f"Shapefile already processed: {GPKG_PATH}")
+    ap = argparse.ArgumentParser(description="Download the IBGE biomes shapefile.")
+    ap.add_argument("--dir", type=Path, required=True, help="AllClear dataset directory")
+    dest = ap.parse_args().dir.expanduser().resolve() / "metadata/shapefiles"
+    if (dest / GPKG_NAME).exists() and (dest / HASH_NAME).exists():
+        print(f"Shapefile already processed: {dest / GPKG_NAME}")
         print("Loading to show available biomes...")
-        gdf = gpd.read_file(GPKG_PATH)
+        gdf = gpd.read_file(dest / GPKG_NAME)
     else:
-        if not ZIP_PATH.exists():
-            download_zip()
+        if not (dest / ZIP_NAME).exists():
+            download_zip(dest)
         else:
-            print(f"Zip already exists: {ZIP_PATH}")
+            print(f"Zip already exists: {dest / ZIP_NAME}")
 
-        verify_or_record_hash()
-        gdf = extract_and_reproject()
+        verify_or_record_hash(dest)
+        gdf = extract_and_reproject(dest)
 
     biomes = sorted(gdf["biome"].unique())
     print(f"\nAvailable biomes ({len(biomes)}):")
     for b in biomes:
         print(f"  {b}")
-    print(f"\nUse these names with --biomes in download.py and filter_datasets.py")
+    print("\nUse these names with --biomes in download.py and filter_datasets.py")
 
 
 if __name__ == "__main__":

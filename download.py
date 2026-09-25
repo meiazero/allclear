@@ -1,327 +1,201 @@
+"""AllClear: download, compact and verify under the directory given by --dir.
+
+    python download.py download --dir <dir> [--from-json <list.json> ...]  # login node + verify
+    python download.py prepare --dir <dir> --workers 64                   # cpuq: compact + verify
+    python download.py verify --dir <dir> [--from-json <list.json> ...] [--sample 500]
+
+Each action exits 0 only when verify passes; re-run the same command to resume.
+
+ROIs: every ROI in metadata/rois/*.txt, restricted to those referenced by --from-json and to
+one spatial filter (--biomes, --brazil or --bbox). Verify checks every raster that the sample
+lists (--from-json, default every metadata/datasets/*.json) need for the selected ROIs.
+
+Source: https://allclear.cs.cornell.edu/dataset/allclear/{metadata.tar.gz,data/<roi>.tar.gz}
+The archives hold float64 rasters; `prepare` rewrites them losslessly (common.py).
+"""
+
 import argparse
 import csv
-import gzip
-import multiprocessing as mp
-import time
+import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import requests
-from tqdm import tqdm
+import biomes
+import common
 
-from biomes import load_biome_rois, normalize_name
-
-# Brazil bounding box
+URL = "https://allclear.cs.cornell.edu/dataset/allclear"
+# Band count per sensor directory.
+BANDS = {"s2_toa": 13, "cld_shdw": 5, "s1": 2, "landsat8": 12, "landsat9": 12}
 BRAZIL_BBOX = (-33.75, -73.99, 5.27, -28.85)  # (lat_min, lon_min, lat_max, lon_max)
-
-ROIS_CSV = Path("metadata/rois/rois_metadata.csv")
-
-# Configuration
-BASE_URL = "http://allclear.cs.cornell.edu/dataset/allclear"
-CHUNK_SIZE = 8192
+ROI_LISTS = ("test_rois_3k.txt", "train_rois_19k.txt", "val_rois_1k.txt")
 AVG_MB_PER_ROI = 184  # ponytail: measured median of sampled ROI archives; --dry-run estimate only
 
-def download_file(url, dest_path, show_progress=True):
-    """Download a file. Returns 'ok', 'notfound' (real 404) or 'error' (connection/timeout/HTTP)."""
-    try:
-        with requests.get(url, stream=True, timeout=30) as response:
-            if response.status_code == 404:
-                return 'notfound'
-            response.raise_for_status()
 
-            total_size = int(response.headers.get("content-length", 0))
-
-            with open(dest_path, "wb") as f:
-                if show_progress:
-                    with tqdm(total=total_size, unit='B', unit_scale=True, desc=dest_path.name) as pbar:
-                        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                            if chunk:
-                                f.write(chunk)
-                                pbar.update(len(chunk))
-                else:
-                    for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                        if chunk:
-                            f.write(chunk)
-        return 'ok'
-    except Exception:
-        if dest_path.exists():
-            dest_path.unlink()
-        return 'error'
-
-def verify_file(file_path):
-    """Verify a file is complete by opening it (gzip archives only)."""
-    try:
-        if file_path.suffix == '.gz':
-            with gzip.open(file_path, 'rb') as f:
-                f.read(1)  # try reading first byte
-        return True
-    except (OSError, EOFError, gzip.BadGzipFile):
-        return False
-
-def download_metadata():
-    """Download metadata files"""
-    metadata_dir = Path("metadata")
-    metadata_dir.mkdir(exist_ok=True)
-    filename = "metadata.tar.gz"
-    url = f"{BASE_URL}/{filename}"
-    dest_path = metadata_dir / filename
-    print(f"Downloading metadata from {url} to {dest_path}")
-    status = download_file(url, dest_path)
-
-    if status == 'ok' and verify_file(dest_path):
-        # Extract the tar.gz file
-        try:
-            import tarfile
-            import shutil
-
-            with tarfile.open(dest_path, 'r:gz') as tar:
-                tar.extractall(path=metadata_dir, filter='data')
-
-            nested_dir = metadata_dir / "metadata"
-            if nested_dir.exists() and nested_dir.is_dir():
-                for item in nested_dir.iterdir():
-                    shutil.move(str(item), str(metadata_dir))
-                nested_dir.rmdir()
-            print(f"Successfully downloaded and extracted {filename}")
-            # Remove the tar.gz file after extraction
-            dest_path.unlink()
-        except Exception as e:
-            print(f"Error extracting {filename}: {e}")
-            if dest_path.exists():
-                dest_path.unlink()
-    elif status == 'ok':
-        print(f"Downloaded {filename} but verification failed")
-        dest_path.unlink()
-    else:
-        print(f"Skipping {filename} - {status} ({url})")
+# ---------------------------------------------------------------- ROI selection
 
 
-def load_roi_list(bbox=None, biomes=None):
-    """Load and combine all ROI IDs from metadata files, with optional filtering.
-
-    Priority: biomes (shapefile) > bbox > none (all ROIs).
-
-    Args:
-        bbox:   (lat_min, lon_min, lat_max, lon_max) or None
-        biomes: list of normalized biome names or None
-    """
-    metadata_dir = Path("metadata")
-    roi_ids = set()
-
-    for filename in ["test_rois_3k.txt", "train_rois_19k.txt", "val_rois_1k.txt"]:
-        file_path = metadata_dir / "rois" / filename
-        if not file_path.exists():
-            print(f"Warning: {filename} not found")
-            continue
-        with open(file_path, 'r') as f:
-            roi_ids.update(line.strip() for line in f if line.strip())
-
-    if biomes:
-        return _filter_by_biomes(roi_ids, biomes)
-
-    if bbox:
-        return _filter_by_bbox(roi_ids, bbox)
-
-    return sorted(roi_ids)
+def sample_lists(root: Path, lists: list[Path] | None) -> list[Path]:
+    return lists or sorted((root / "metadata/datasets").glob("*.json"))
 
 
-def _filter_by_biomes(roi_ids: set, biomes: list) -> list:
-    """Filter ROIs to those whose centroid falls inside the selected biomes."""
-    result = sorted(roi_ids & load_biome_rois(biomes))
-    print(f"Biome filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
-    return result
+def roi_of(sample: dict) -> str:
+    roi = sample["roi"]
+    return roi[0] if isinstance(roi, list) else roi
 
 
-def _filter_by_bbox(roi_ids: set, bbox: tuple) -> list:
-    """Filter ROIs using a lat/lon bounding box."""
+def rois_in_bbox(root: Path, bbox: tuple[float, float, float, float]) -> set[str]:
     lat_min, lon_min, lat_max, lon_max = bbox
-    if not ROIS_CSV.exists():
-        print("Warning: rois_metadata.csv not found, skipping bbox filter")
-        return sorted(roi_ids)
-
-    with open(ROIS_CSV, newline='') as f:
-        filtered = {
+    with (root / "metadata/rois/rois_metadata.csv").open(newline="") as f:
+        return {
             f"roi{row['roi_id']}"
             for row in csv.DictReader(f)
-            if lat_min <= float(row['latitude']) <= lat_max
-            and lon_min <= float(row['longitude']) <= lon_max
+            if lat_min <= float(row["latitude"]) <= lat_max
+            and lon_min <= float(row["longitude"]) <= lon_max
         }
 
-    result = sorted(roi_ids & filtered)
-    print(f"Bbox filter: {len(result):,} ROIs (from {len(roi_ids):,} total)")
-    return result
 
-def rois_from_json(json_paths):
-    """Set of ROI ids referenced by one or more dataset JSONs (sample['roi'][0])."""
-    import json
-    roi_ids = set()
-    for p in json_paths:
-        with open(p) as f:
-            data = json.load(f)
-        for v in data.values():
-            r = v["roi"]
-            roi_ids.add(r[0] if isinstance(r, list) else r)
-    return roi_ids
+def select_rois(
+    root: Path,
+    lists: list[Path] | None = None,
+    biome_names: list[str] | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> set[str]:
+    """ROIs of metadata/rois/*.txt, restricted to --from-json lists and one spatial filter."""
+    out: set[str] = set()
+    for name in ROI_LISTS:
+        path = root / "metadata/rois" / name
+        out |= {line.strip() for line in path.read_text().splitlines() if line.strip()}
+    if lists:
+        out &= {roi_of(s) for p in lists for s in json.loads(p.read_text()).values()}
+    if biome_names:
+        out &= biomes.load_biome_rois(biome_names, root / "metadata")
+    elif bbox:
+        out &= rois_in_bbox(root, bbox)
+    return out
 
 
-def download_one_roi(roi_id):
-    """Download+extract one ROI. Returns (roi_id, status): 'ok'|'skip'|'notfound'|'error'.
+# ---------------------------------------------------------------- download
 
-    Silent by design: the parent process owns the single progress bar and the
-    summary, so workers just report status instead of printing per-ROI.
-    """
-    data_dir = Path("data")
-    dest_path = data_dir / f"{roi_id}.tar.gz"
-    url = f"{BASE_URL}/data/{roi_id}.tar.gz"
 
-    # Already downloaded, verified, and extracted → skip
-    if (data_dir / roi_id).exists():
-        return roi_id, "skip"
+def download_metadata(root: Path) -> None:
+    if (root / "metadata/datasets").is_dir():
+        return
+    archive = root / "metadata.tar.gz"
+    common.fetch(f"{URL}/metadata.tar.gz", archive)
+    staged = common.extract_atomic(archive, root / ".staging_metadata")
+    inner = staged / "metadata" if (staged / "metadata").is_dir() else staged
+    common.move_tree(inner, root / "metadata")
+    shutil.rmtree(staged, ignore_errors=True)
 
-    # Leftover partial archive from an interrupted run → drop it
-    if dest_path.exists():
-        dest_path.unlink()
 
-    status = download_file(url, dest_path, show_progress=False)
-    time.sleep(0.1)
+def download(root: Path, rois: set[str], workers: int = 8) -> dict[str, str]:
+    """Fetch and extract every ROI archive not yet in <root>/data -> {roi: error} of failures."""
+    data = root / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    todo = sorted(r for r in rois if not (data / r).is_dir())
 
-    if status == "ok" and verify_file(dest_path):
+    def one(roi: str) -> tuple[str, str]:
         try:
-            import shutil
-            import tarfile
-            # Extract to a staging dir + atomic rename: data/<roi>/ only ever appears
-            # complete, so the "dir exists -> skip" check above stays trustworthy even
-            # if the process dies mid-extraction.
-            tmp_dir = data_dir / f".extract_{roi_id}"
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            with tarfile.open(dest_path, "r:gz") as tar:
-                tar.extractall(path=tmp_dir, filter="data")
-            (tmp_dir / roi_id).rename(data_dir / roi_id)
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            dest_path.unlink()
-            return roi_id, "ok"
-        except Exception:
-            if dest_path.exists():
-                dest_path.unlink()
-            return roi_id, "error"
+            archive = data / f"{roi}.tar.gz"
+            common.fetch(f"{URL}/data/{roi}.tar.gz", archive)
+            staged = common.extract_atomic(archive, data / f".staging_{roi}")
+            (staged / roi).rename(data / roi)
+            shutil.rmtree(staged, ignore_errors=True)
+            return roi, "ok"
+        except Exception as e:  # keep going; failures are listed and retried on re-run
+            return roi, f"error: {e}"
 
-    if dest_path.exists():
-        dest_path.unlink()
-    return roi_id, status if status != "ok" else "error"
+    print(f"AllClear: {len(todo)} ROIs to download into {data}")
+    results = {}
+    with ThreadPoolExecutor(workers) as pool:
+        for i, (roi, status) in enumerate(pool.map(one, todo), 1):
+            results[roi] = status
+            if status != "ok" or i % 100 == 0:
+                print(f"[{i}/{len(todo)}] {roi} {status}", flush=True)
+    failed = {r: s for r, s in results.items() if s != "ok"}
+    print(f"AllClear: {len(todo) - len(failed)} downloaded, {len(failed)} failed")
+    return failed
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Download AllClear dataset.\n\n"
-                    "Steps can be run independently:\n"
-                    "  metadata only : --metadata-only\n"
-                    "  images only   : --data-only  (metadata must already exist)\n"
-                    "  both (default): omit both flags",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+
+def compact(root: Path, workers: int = 8) -> dict[str, str]:
+    return common.compact_dirs((d for d in (root / "data").glob("roi*") if d.is_dir()), workers)
+
+
+# ---------------------------------------------------------------- verify
+
+
+def needed_paths(root: Path, lists: list[Path] | None, rois: set[str]) -> list[str]:
+    """Every raster the sample lists need for `rois`, including the cld_shdw of each S2 date."""
+    paths: set[str] = set()
+    for path in sample_lists(root, lists):
+        for sample in json.loads(path.read_text()).values():
+            if roi_of(sample) not in rois:
+                continue
+            for key in ("s2_toa", "s1", "landsat8", "landsat9", "target"):
+                for _, rel in sample.get(key, []):
+                    paths.add(rel)
+                    if key in ("s2_toa", "target"):
+                        paths.add(rel.replace("s2_toa", "cld_shdw"))
+    return sorted(paths)
+
+
+def verify(root: Path, rois: set[str], lists: list[Path] | None = None, sample: int = 500) -> bool:
+    """Existence of every file the lists need + a deep read of `sample` random rasters."""
+    rels = needed_paths(root, lists, rois)
+    missing = [r for r in rels if not (root / "data" / r).is_file()]
+    absent = set(missing)
+    files = [root / "data" / r for r in rels if r not in absent]
+    extra = {
+        "lists": [str(p) for p in (lists or [])] or "all metadata/datasets/*.json",
+        "selected_rois": len(rois),
+        "missing_rois": sorted({m.split("/")[0] for m in missing}),
+    }
+    return common.verify_files(
+        "allclear", root, files, missing, lambda p: BANDS.get(p.parent.name), extra, sample
     )
-    # Steps
-    step = parser.add_mutually_exclusive_group()
-    step.add_argument('--metadata-only', action='store_true',
-                      help='Download and extract metadata only, then stop')
-    step.add_argument('--data-only', action='store_true',
-                      help='Skip metadata download, go straight to ROI images '
-                           '(metadata must already exist in ./metadata/)')
-    # Resources
-    parser.add_argument('--cpus', type=int, default=8,
-                        help='Number of CPU cores to use (default: 8)')
-    # Spatial filters (mutually exclusive, biomes takes priority)
-    spatial = parser.add_mutually_exclusive_group()
-    spatial.add_argument('--biomes', nargs='+',
-                         help='Download only ROIs within selected biomes '
-                              '(requires download_shapefile.py first). '
-                              'e.g. --biomes amazonia cerrado pantanal')
-    spatial.add_argument('--brazil', action='store_true',
-                         help='Download only ROIs within Brazil (bbox approximation)')
-    spatial.add_argument('--bbox', type=float, nargs=4,
-                         metavar=('LAT_MIN', 'LON_MIN', 'LAT_MAX', 'LON_MAX'),
-                         help='Download only ROIs within bounding box')
-    # Sample-driven filter: restrict to ROIs referenced by dataset JSON(s).
-    parser.add_argument('--from-json', nargs='+', metavar='JSON',
-                        help='Download only ROIs referenced by these dataset JSON(s), e.g. '
-                             'metadata/datasets/train_tx3_s2-s1_10pct.json. Note: pct subsets '
-                             'are sampled per-sequence, so 10%% of samples still spans ~72%% of '
-                             'ROIs. Intersects with any spatial filter.')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='Resolve the ROI list, print count + estimated size, then exit '
-                             '(downloads nothing).')
-    args = parser.parse_args()
 
-    n_cores = max(1, args.cpus - 1)
 
-    # --- Step 1: metadata ---
-    if not args.data_only:
-        print("==> Step 1/2: Downloading metadata...")
-        download_metadata()
-    else:
-        metadata_dir = Path("metadata")
-        if not (metadata_dir / "rois" / "rois_metadata.csv").exists():
-            parser.error("--data-only requires metadata to already exist. "
-                         "Run without --data-only first, or use --metadata-only.")
-        print("==> Step 1/2: Skipping metadata download (--data-only).")
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("action", choices=("download", "prepare", "verify"))
+    ap.add_argument(
+        "--dir", type=Path, required=True, help="where the dataset is created and saved"
+    )
+    ap.add_argument("--from-json", type=Path, nargs="+", help="sample lists (default: all)")
+    spatial = ap.add_mutually_exclusive_group()
+    spatial.add_argument(
+        "--biomes", nargs="+", help="e.g. amazonia cerrado (download_shapefile.py)"
+    )
+    spatial.add_argument("--brazil", action="store_true", help="Brazil bounding box")
+    spatial.add_argument(
+        "--bbox", type=float, nargs=4, metavar=("LAT_MIN", "LON_MIN", "LAT_MAX", "LON_MAX")
+    )
+    ap.add_argument("--dry-run", action="store_true", help="download: print ROI count and size")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--sample", type=int, default=500, help="rasters opened by verify")
+    args = ap.parse_args()
+    root = args.dir.expanduser().resolve()
+    lists = [p.expanduser().resolve() for p in args.from_json] if args.from_json else None
 
-    if args.metadata_only:
-        print("\nMetadata download complete (--metadata-only).")
-        roi_ids = load_roi_list()
-        print(f"Available ROIs: {len(roi_ids):,} total")
-        return
-
-    # --- Step 2: ROI images ---
-    # Resolve spatial filter
-    biomes = None
-    bbox = None
-    if args.biomes:
-        biomes = [normalize_name(b) for b in args.biomes]
-        print(f"\nBiome filter: {biomes}")
-    elif args.brazil:
-        bbox = BRAZIL_BBOX
-        print(f"\nBrazil bbox filter: {BRAZIL_BBOX}")
-    elif args.bbox:
-        bbox = tuple(args.bbox)
-        print(f"\nBbox filter: {bbox}")
-
-    print("\n==> Step 2/2: Loading ROI list...")
-    roi_ids = load_roi_list(bbox=bbox, biomes=biomes)
-    print(f"Found {len(roi_ids):,} unique ROI IDs")
-
-    if args.from_json:
-        json_rois = rois_from_json(args.from_json)
-        roi_ids = sorted(set(roi_ids) & json_rois)
-        print(f"JSON filter ({len(args.from_json)} file(s)): {len(json_rois):,} referenced "
-              f"→ {len(roi_ids):,} to download")
-
+    if args.action == "download":
+        download_metadata(root)
+    names = [biomes.normalize_name(b) for b in args.biomes] if args.biomes else None
+    bbox = BRAZIL_BBOX if args.brazil else tuple(args.bbox) if args.bbox else None
+    rois = select_rois(root, lists, names, bbox)
     if args.dry_run:
-        gb = len(roi_ids) * AVG_MB_PER_ROI / 1024
-        print(f"\n[dry-run] {len(roi_ids):,} ROIs ≈ {gb:,.0f} GB ({gb / 1024:.2f} TB) "
-              f"at ~{AVG_MB_PER_ROI} MB/ROI. Nothing downloaded.")
+        gb = len(rois) * AVG_MB_PER_ROI / 1024
+        print(f"[dry-run] {len(rois):,} ROIs ~ {gb:,.0f} GB at ~{AVG_MB_PER_ROI} MB/ROI")
         return
 
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
-    print(f"Downloading {len(roi_ids):,} ROIs using {n_cores} processes...")
+    failed = {}
+    if args.action == "download":
+        failed = download(root, rois, args.workers)
+    elif args.action == "prepare":
+        failed = compact(root, args.workers)
+    ok = verify(root, rois, lists, args.sample)  # after a partial failure too: the report lists it
+    raise SystemExit(0 if ok and not failed else 1)
 
-    tally = {"ok": 0, "skip": 0, "notfound": 0, "error": 0}
-    failed = []
-    with mp.Pool(n_cores) as pool:
-        with tqdm(total=len(roi_ids), unit="roi") as bar:
-            for roi_id, status in pool.imap_unordered(download_one_roi, roi_ids):
-                tally[status] += 1
-                if status in ("notfound", "error"):
-                    failed.append((roi_id, status))
-                bar.update(1)
-                bar.set_postfix(ok=tally["ok"], skip=tally["skip"],
-                                miss=tally["notfound"], err=tally["error"])
-
-    print(f"\nDone. downloaded={tally['ok']:,}  already={tally['skip']:,}  "
-          f"missing={tally['notfound']:,}  errors={tally['error']:,}")
-    if failed:
-        fp = Path("failed_rois.txt")
-        fp.write_text("\n".join(f"{r}\t{s}" for r, s in failed))
-        print(f"{len(failed):,} failed → {fp}. Rerun the same command to retry "
-              f"(errors are usually transient network; 'notfound' = truly absent on server).")
 
 if __name__ == "__main__":
     main()
