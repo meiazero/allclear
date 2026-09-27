@@ -1,4 +1,4 @@
-"""Transfer and compaction. Identical copy in meiazero/allclear and meiazero/sen12mscrts."""
+"""Transfer and compaction. Identical copy in meiazero/{allclear,sen12mscrts,sen1floods11}."""
 
 import tarfile
 from pathlib import Path
@@ -55,3 +55,12 @@ def test_compaction_picks_the_smallest_dtype_that_keeps_every_value(
         assert np.array_equal(src.read(), arr.astype(np.float32), equal_nan=True)
         assert src.transform == rasterio.transform.from_origin(0, 256, 1, 1)
     assert not common.compact_raster(path)  # tagged: a re-run skips it
+
+
+def test_compaction_keeps_negative_integer_labels(tmp_path: Path) -> None:
+    arr = np.resize(np.array([-1, 0, 1], dtype=np.int16), (1, 256, 256))  # Sen1Floods11 labels
+    path = tmp_path / "label.tif"
+    path.write_bytes(make_tif(arr, dtype="int16"))
+    assert common.compact_raster(path)
+    with rasterio.open(path) as src:
+        assert src.dtypes[0] == "int16" and np.array_equal(src.read(), arr)

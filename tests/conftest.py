@@ -1,6 +1,6 @@
 """Local HTTP server with Range support and in-memory archives/rasters.
 
-Identical copy in meiazero/allclear and meiazero/sen12mscrts: change both.
+Identical copy in meiazero/allclear, meiazero/sen12mscrts and meiazero/sen1floods11: change all.
 """
 
 import io

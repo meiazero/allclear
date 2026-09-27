@@ -91,7 +91,8 @@ decoding, which a DataLoader pays for, gets 6–12× faster:
 S1 is the only sensor whose float64 values are not exact in float32 (relative change
 ≤ 6e-8).
 `common.py` is an identical copy of the one in
-[meiazero/sen12mscrts](https://github.com/meiazero/sen12mscrts).
+[meiazero/sen12mscrts](https://github.com/meiazero/sen12mscrts) and
+[meiazero/sen1floods11](https://github.com/meiazero/sen1floods11).
 
 ## Metadata structure
 

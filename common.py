@@ -1,6 +1,6 @@
 """Resumable transfer, lossless compaction of rasters and the per-raster check used by `verify`.
 
-Identical copy in meiazero/allclear and meiazero/sen12mscrts: change both.
+Identical copy in meiazero/allclear, meiazero/sen12mscrts and meiazero/sen1floods11: change all.
 
 Every step is resumable: archives are fetched with HTTP Range into `.part` files, integrity
 is checked by extracting into a staging directory, and only a complete result is moved into
@@ -67,8 +67,11 @@ def move_tree(src: Path, dst: Path) -> None:
 
 def fits(a: np.ndarray, dtype: str) -> bool:
     """True if `dtype` stores every value of `a` (NaN included) unchanged."""
+    # Compared in float64: casting back to an integer `a.dtype` would wrap -1 -> 65535 -> -1.
     with np.errstate(invalid="ignore", over="ignore"):
-        return np.array_equal(a.astype(dtype).astype(a.dtype), a, equal_nan=True)
+        return np.array_equal(
+            a.astype(dtype).astype("float64"), a.astype("float64"), equal_nan=True
+        )
 
 
 def smallest_exact_dtype(a: np.ndarray) -> str:
@@ -151,16 +154,16 @@ def compact_dirs(dirs: Iterable[Path], workers: int = 8) -> dict[str, str]:
 
 
 def check_raster(path: Path, bands: int | None) -> str | None:
-    """None if the raster opens with the expected band count, size and finite values."""
+    """None if the raster opens with the expected band count, size and a finite value in band 1."""
     try:
         with rasterio.open(path) as src:
             if bands and src.count != bands:
                 return f"{src.count} bands, expected {bands}"
             if min(src.width, src.height) < MIN_SIDE:
                 return f"{src.width}x{src.height} < {MIN_SIDE}"
-            window = rasterio.windows.Window(0, 0, min(64, src.width), min(64, src.height))
-            if not np.isfinite(src.read(1, window=window)).any():
-                return "no finite value in the first window"
+            # The whole band: a valid S1 chip can be NaN over any corner (Sen1Floods11).
+            if not np.isfinite(src.read(1)).any():
+                return "no finite value in band 1"
     except Exception as e:
         return f"unreadable: {e}"
     return None
